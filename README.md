@@ -1,19 +1,17 @@
----
-
 # Lambda Function for Creating AMIs using EventBridge Schedule
 
 This CloudFormation template deploys a Lambda function that creates Amazon Machine Images (AMIs) based on a schedule defined in Amazon EventBridge. This can be useful for automated backups or snapshotting of EC2 instances.
 
 ## Supported parameters:
-**createAmisAt**: cron schedule to create AMIs, by default at midnight. More: https://docs.aws.amazon.com/eventbridge/latest/userguide/eb-cron-expressions.html
+`createAmisAt`: cron schedule to create AMIs, by default at midnight. More: https://docs.aws.amazon.com/eventbridge/latest/userguide/eb-cron-expressions.html
 
-**createAmisLambdaTimeout**: If you have lots of ec2 instances - it requires to adjust this parameter
+`createAmisLambdaTimeout`: If you have lots of ec2 instances - it requires to adjust this parameter
 
-**deleteOldAmisAt**: cron schedule to delete old AMIs, by default at 2AM. More: https://docs.aws.amazon.com/eventbridge/latest/userguide/eb-cron-expressions.html
+`deleteOldAmisAt`: cron schedule to delete old AMIs, by default at 2AM. More: https://docs.aws.amazon.com/eventbridge/latest/userguide/eb-cron-expressions.html
 
-**keepAmis**: How much AMIs you'd like to keep, 3 by default
+`keepAmis`: How much AMIs you'd like to keep, 3 by default
 
-**rotateAmisLambdaTimeout**: If you have lots of AMIs - it requires to adjust this parameter
+`rotateAmisLambdaTimeout`: If you have lots of AMIs - it requires to adjust this parameter
 
 ## Deployment Steps
 
