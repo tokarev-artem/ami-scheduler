@@ -22,13 +22,13 @@ This CloudFormation template deploys a Lambda function that creates Amazon Machi
 2. **Clone the Repository**: Clone this GitHub repository to your local machine.
 
    ```bash
-   git clone https://github.com/RealArtemiy/ami-creator.git
+   git clone https://github.com/RealArtemiy/ami-scheduler.git
    ```
 
 3. **Navigate to Template Directory**: Enter into the directory containing your CloudFormation template.
 
    ```bash
-   cd ami-creator
+   cd ami-scheduler
    ```
 
 4. **Deploy Stack**: Use the AWS CLI to deploy the CloudFormation stack. Replace `<stack_name>` with your desired stack name.
