@@ -60,3 +60,9 @@ This CloudFormation template deploys a Lambda function that creates Amazon Machi
 7. **Monitor Deployment**: Monitor the stack creation process in the CloudFormation dashboard.
 
 ---
+
+Resources to be created:
+- AWS::Lambda::Function
+- AWS::IAM::Role	
+- AWS::Lambda::Permission	
+- AWS::Events::Rule
