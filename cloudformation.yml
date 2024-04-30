@@ -1,0 +1,282 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Stack to create AMIs by schedule
+Parameters:
+  createAmisAt:
+    Type: String
+    Default: "cron(0 0 * * ? *)"
+    Description: Schedule to start AMIs creation
+  createAmisLambdaTimeout:
+    Type: String
+    Default: 10
+    Description: Depending of number ec2 instances you have - it might be required to increase lambda timeout
+  deleteOldAmisAt:
+    Type: String
+    Default: "cron(0 2 * * ? *)"
+    Description: Schedule to start old AMIs deletion
+  keepAmis:
+    Type: String
+    Default: 3
+    Description: How much AMIs to keep
+  rotateAmisLambdaTimeout:
+    Type: String
+    Default: 10
+    Description: Depending of number AMIs you have - it might be required to increase lambda timeout
+Resources:
+## Start CreateAMIs 
+  createAmisFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.11
+      Role: !GetAtt createAmisRole.Arn
+      FunctionName: CreateAMI
+      Description: Scheduled lambda function to create AMIs
+      Handler: index.lambda_handler
+      Timeout : !Ref createAmisLambdaTimeout
+      Architectures: 
+        - arm64
+      Code:
+        ZipFile: |
+            import boto3
+            import datetime
+
+            def create_ami(ec2, instance_id, instance_name, description):
+                timestamp = datetime.datetime.now().strftime('%Y-%m-%d-%H-%M-%S')
+                ami_name = f'{instance_name}-{instance_id}-{timestamp}'
+                response = ec2.create_image(
+                    InstanceId=instance_id,
+                    Name=ami_name,
+                    Description=description,
+                    NoReboot=True,
+                    TagSpecifications=[
+                        {
+                            'ResourceType': 'image',
+                            'Tags': [
+                                {'Key': 'Name', 'Value': instance_name},
+                                {'Key': 'Automatic', 'Value': 'true'},
+                                
+                                # Add additional tags as needed
+                            ]
+                        },
+                    ]
+                )
+                return response['ImageId'], ami_name
+
+            def lambda_handler(event, context):
+                ec2 = boto3.client('ec2')
+                description = 'Scheduled Backup'
+                response_messages = []
+
+                try:
+                    instances = ec2.describe_instances(Filters=[{'Name': 'instance-state-name', 'Values': ['running']}])
+                    for reservation in instances['Reservations']:
+                        for instance in reservation['Instances']:
+                            instance_id = instance['InstanceId']
+                            instance_name = next((tag['Value'] for tag in instance.get('Tags', []) if tag['Key'] == 'Name'), None)
+                            if instance_name:
+                                ami_id, ami_name = create_ami(ec2, instance_id, instance_name, description)
+                                response_messages.append(f"Created AMI: {ami_name} from Instance: {instance_name} (ID: {instance_id})")
+                except Exception as e:
+                    response_messages.append(f"Error: {str(e)}")
+                
+                # Log response messages
+                for message in response_messages:
+                    print(message)
+                
+                return response_messages
+
+
+  createAmisRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+      - PolicyName: ec2Policy
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action:
+                - "ec2:DescribeImages"
+                - "ec2:DescribeInstances"
+                - "ec2:CreateTags"
+                - "ec2:CreateImage"
+                - "ec2:DescribeSnapshots"
+              Resource: "*"
+      - PolicyName: cloudWatchLogsPolicy
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action:
+                - "logs:CreateLogGroup"
+                - "logs:CreateLogStream"
+                - "logs:PutLogEvents"
+              Resource: "arn:aws:logs:*:*:*"
+
+  triggerCreateAMILambda:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "Trigger CreateAMI Lambda at midnight"
+      ScheduleExpression: !Ref createAmisAt
+      State: "ENABLED"
+      Targets:
+        - Arn: !GetAtt createAmisFunction.Arn
+          Id: "TargetFunction"
+
+  PermissionsToInvokeCreateAmisFunction: 
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: !Ref createAmisFunction
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt triggerCreateAMILambda.Arn
+
+## Start rotate AMIs 
+  rotateAMIsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.11
+      Role: !GetAtt rotateAMIsRole.Arn
+      FunctionName: RotateAMI
+      Description: Scheduled lambda function to delete old AMIs
+      Handler: index.lambda_handler
+      Timeout: !Ref rotateAmisLambdaTimeout
+      Architectures: 
+        - arm64
+      Environment:
+        Variables: 
+          keepAmis: !Ref keepAmis
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+
+          def describe_instances(ec2):
+            if 'instances_cache' not in describe_instances.__dict__:
+                describe_instances.instances_cache = ec2.describe_instances()['Reservations']
+            return describe_instances.instances_cache
+
+          def batch_delete_images_and_snapshots(ec2, image_ids):
+              for image_id in image_ids:
+                  print("Deregistering image: " + image_id)
+                  ec2.deregister_image(ImageId=image_id)
+                  
+                  # Describe the image to get its snapshots
+                  try:
+                      image_response = ec2.describe_images(ImageIds=[image_id])
+                      if not image_response['Images']:
+                          continue
+
+                      image_snapshots = image_response['Images'][0].get('BlockDeviceMappings', [])
+                      snapshot_ids = [snapshot['Ebs']['SnapshotId'] for snapshot in image_snapshots if 'Ebs' in snapshot]
+                      if snapshot_ids:
+                          print("Deleting snapshot: " + ", ".join(snapshot_ids))
+                          response = ec2.delete_snapshots(SnapshotIds=snapshot_ids)
+                          print("Delete snapshots response:", response)
+                  except (IndexError, KeyError) as e:
+                      print(f"Error handling image {image_id}: {e}")
+
+          def lambda_handler(event, context):
+              # Initialize Boto3 clients
+              ec2 = boto3.client('ec2')
+
+              # Define the tag name for identifying instances
+              max_amis_to_keep = int(os.getenv('keepAmis'))
+
+              # Get a list of all instances
+              instances = describe_instances(ec2)
+
+              image_ids_to_delete = []
+
+              for reservation in instances:
+                  for instance in reservation['Instances']:
+                      # Find the instance name tag, if available
+                      instance_name = None
+                      for tag in instance.get('Tags', []):
+                          if tag['Key'] == 'Name':
+                              instance_name = tag['Value']
+                              break
+
+                      if instance_name:
+                          # Get images (AMIs) for the instance based on the tag
+                          images = ec2.describe_images(Owners=['self'], Filters=[{'Name': 'tag:Name', 'Values': [instance_name]}])['Images']
+
+                          # Collect images to delete along with their snapshots if they have the Automatic tag
+                          for image in images:
+                              if 'Tags' in image:
+                                  for tag in image['Tags']:
+                                      if tag['Key'] == 'Automatic' and tag['Value'] == 'true':
+                                          # Sort images by creation date (most recent first)
+                                          sorted_images = sorted(images, key=lambda x: x['CreationDate'], reverse=True)
+                                          # Keep only the last max_amis_to_keep images
+                                          images_to_keep = sorted_images[:max_amis_to_keep]
+                                          # Collect images to delete
+                                          if image not in images_to_keep:
+                                              image_ids_to_delete.append(image['ImageId'])
+                                          break  # Break once the Automatic tag is found to avoid unnecessary checks for subsequent tags
+
+              if image_ids_to_delete:
+                  batch_delete_images_and_snapshots(ec2, image_ids_to_delete)
+
+  rotateAMIsRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+      - PolicyName: ec2Policy
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action:
+                - "ec2:DescribeImages"
+                - "ec2:DescribeInstances"
+                - "ec2:DeregisterImage"
+                - "ec2:DeleteSnapshot"
+              Resource: "*"
+      - PolicyName: cloudWatchLogsPolicy
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action:
+                - "logs:CreateLogGroup"
+                - "logs:CreateLogStream"
+                - "logs:PutLogEvents"
+              Resource: "arn:aws:logs:*:*:*"
+
+  triggerRotateAMILambda:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "Trigger rotateAMI Lambda at midnight"
+      ScheduleExpression: !Ref deleteOldAmisAt
+      State: "ENABLED"
+      Targets:
+        - Arn: !GetAtt rotateAMIsFunction.Arn
+          Id: "TargetFunction"
+
+  PermissionsToInvokerotateAMIsFunction: 
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: !Ref rotateAMIsFunction
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt triggerRotateAMILambda.Arn
