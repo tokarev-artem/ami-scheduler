@@ -161,71 +161,78 @@ Resources:
           import os
 
           def describe_instances(ec2):
-            if 'instances_cache' not in describe_instances.__dict__:
-                describe_instances.instances_cache = ec2.describe_instances()['Reservations']
-            return describe_instances.instances_cache
+              if 'instances_cache' not in describe_instances.__dict__:
+                  describe_instances.instances_cache = ec2.describe_instances()['Reservations']
+              return describe_instances.instances_cache
 
           def batch_delete_images_and_snapshots(ec2, image_ids):
               for image_id in image_ids:
-                  print("Deregistering image: " + image_id)
-                  ec2.deregister_image(ImageId=image_id)
-                  
-                  # Describe the image to get its snapshots
                   try:
                       image_response = ec2.describe_images(ImageIds=[image_id])
-                      if not image_response['Images']:
-                          continue
+                      snapshot_ids = []
 
-                      image_snapshots = image_response['Images'][0].get('BlockDeviceMappings', [])
-                      snapshot_ids = [snapshot['Ebs']['SnapshotId'] for snapshot in image_snapshots if 'Ebs' in snapshot]
-                      if snapshot_ids:
-                          print("Deleting snapshot: " + ", ".join(snapshot_ids))
-                          response = ec2.delete_snapshots(SnapshotIds=snapshot_ids)
-                          print("Delete snapshots response:", response)
-                  except (IndexError, KeyError) as e:
-                      print(f"Error handling image {image_id}: {e}")
+                      if image_response['Images']:
+                          block_device_mappings = image_response['Images'][0].get('BlockDeviceMappings', [])
+                          snapshot_ids = [
+                              mapping['Ebs']['SnapshotId']
+                              for mapping in block_device_mappings
+                              if 'Ebs' in mapping and 'SnapshotId' in mapping['Ebs']
+                          ]
+
+                      print("Deregistering image:", image_id)
+                      ec2.deregister_image(ImageId=image_id)
+
+                      for snapshot_id in snapshot_ids:
+                          try:
+                              print(f"Deleting snapshot: {snapshot_id}")
+                              ec2.delete_snapshot(SnapshotId=snapshot_id)
+                          except Exception as e:
+                              print(f"Could not delete snapshot {snapshot_id}: {e}")
+
+                  except Exception as e:
+                      print(f"Error processing image {image_id}: {e}")
 
           def lambda_handler(event, context):
-              # Initialize Boto3 clients
               ec2 = boto3.client('ec2')
+              max_amis_to_keep = int(os.getenv('keepAmis', '3'))
 
-              # Define the tag name for identifying instances
-              max_amis_to_keep = int(os.getenv('keepAmis'))
-
-              # Get a list of all instances
               instances = describe_instances(ec2)
-
               image_ids_to_delete = []
 
               for reservation in instances:
                   for instance in reservation['Instances']:
-                      # Find the instance name tag, if available
                       instance_name = None
                       for tag in instance.get('Tags', []):
                           if tag['Key'] == 'Name':
                               instance_name = tag['Value']
                               break
 
-                      if instance_name:
-                          # Get images (AMIs) for the instance based on the tag
-                          images = ec2.describe_images(Owners=['self'], Filters=[{'Name': 'tag:Name', 'Values': [instance_name]}])['Images']
+                      if not instance_name:
+                          continue
 
-                          # Collect images to delete along with their snapshots if they have the Automatic tag
-                          for image in images:
-                              if 'Tags' in image:
-                                  for tag in image['Tags']:
-                                      if tag['Key'] == 'Automatic' and tag['Value'] == 'true':
-                                          # Sort images by creation date (most recent first)
-                                          sorted_images = sorted(images, key=lambda x: x['CreationDate'], reverse=True)
-                                          # Keep only the last max_amis_to_keep images
-                                          images_to_keep = sorted_images[:max_amis_to_keep]
-                                          # Collect images to delete
-                                          if image not in images_to_keep:
-                                              image_ids_to_delete.append(image['ImageId'])
-                                          break  # Break once the Automatic tag is found to avoid unnecessary checks for subsequent tags
+                      images = ec2.describe_images(
+                          Owners=['self'],
+                          Filters=[{'Name': 'tag:Name', 'Values': [instance_name]}]
+                      )['Images']
+
+                      auto_images = [
+                          img for img in images
+                          if any(tag['Key'] == 'Automatic' and tag['Value'].lower() == 'true' for tag in img.get('Tags', []))
+                      ]
+
+                      sorted_images = sorted(auto_images, key=lambda x: x['CreationDate'], reverse=True)
+                      images_to_keep = sorted_images[:max_amis_to_keep]
+                      keep_ids = {img['ImageId'] for img in images_to_keep}
+
+                      for img in auto_images:
+                          if img['ImageId'] not in keep_ids:
+                              image_ids_to_delete.append(img['ImageId'])
 
               if image_ids_to_delete:
                   batch_delete_images_and_snapshots(ec2, image_ids_to_delete)
+              else:
+                  print("No AMIs to delete.")
+
 
   rotateAMIsRole:
     Type: 'AWS::IAM::Role'
